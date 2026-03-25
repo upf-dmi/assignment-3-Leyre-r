@@ -4,26 +4,37 @@ author: "Leyre Roca (leyre.roca01@estudiant.upf.edu"
 date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
 output:
   html_document:
-    theme: cosmo          # Temas limpios: cosmo, flatly o lumen
-    highlight: tango      # Estilo de resaltado de código
-    toc: true             # Tabla de contenidos
-    toc_float: true       # Que la tabla te siga al hacer scroll
+    theme: cosmo         
+    highlight: tango      
+    toc: true             
+    toc_float: true       
     fig_caption: true
 ---
+<style>
+table {
+    margin: 0 auto !important;
+    width: auto !important;
+}
+.table caption {
+    color: #333333;
+    font-weight: bold;
+    font-size: 1.2em;
+    margin-top: 10px;
+    margin-bottom: 10px;
+    text-align: left;
+    caption-side: top;       
+    min-width: 500px;        
+    white-space: nowrap;
+}
+</style>
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
   echo = TRUE, 
   warning = FALSE, 
   message = FALSE,
-  fig.align = "center",
-  out.width = "80%")
+  fig.align = "center")
 ```
-
-```{r install packages, message=FALSE, warning=FALSE}
-#install.packages(c("caret","recipes","randomForest","miceRanger","pROC","tidymodels","ranger","vip"))
-```
-
 
 ```{r libraries setup, message=FALSE, warning=FALSE}
 library(readxl)
@@ -39,10 +50,11 @@ library(patchwork)
 library(recipes)
 library(randomForest)
 library(pROC)
-
 library(tidymodels)
 library(vip)
 library(ranger)
+library(knitr)
+library(tune)
 ```
 
 # Exercise 1
@@ -60,7 +72,7 @@ Report the following performance metrics from cross-validation:
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
 
 ```{r Preparing metadata, message=FALSE, warning=FALSE}
-#Abrir tablas
+#Preparing metadata
 df_metadata <- read_excel("data/raw_data/Table-S1.Additional-Demographical-and-Baseline-Characteristics-of-COVID-19-Patients-and-Control-Groups.xlsx", sheet = 2)
 df_metadata <- clean_names(df_metadata)
 
@@ -118,10 +130,8 @@ df_2_protein$diagnosis <- factor(df_2_protein$diagnosis, levels = c("Severe","No
 ```{r Random Forest, message=FALSE, warning=FALSE}
 #1. Split in Training (80%) and Test (20%) Data
 set.seed(123)
-# Solo intentamos imputar proteínas que tengan menos del 30% de NAs
-# Las que tengan más, las borramos porque la imputación no será fiable (las quito aqui con el set completo porque train y test data tienen que tener las mismas columnas)
 
-#SPLIT INICIAL
+#Initial split
 data_split <- initial_split(df_2_protein, prop = 0.80, strata = diagnosis)
 train_data <- training(data_split)
 test_data <- testing(data_split)
@@ -129,49 +139,40 @@ test_data <- testing(data_split)
 
 # -------- Random Forest --------------
 
-# 4. VALIDACIÓN CRUZADA Y TUNING (Combinado)
+# Cross validation and tuning
 cv_folds <- vfold_cv(train_data, v = 5, strata = diagnosis)
 
-# 3. EL WORKFLOW 
-# Definimos la receta (solo para normalizar y limpiar varianza cero)
+# WORKFLOW 
+# Define recipe (normalization and  y cleaning variance)
 rf_recipe <- recipe(diagnosis ~ ., data = train_data) %>%
   step_filter_missing(all_predictors(), threshold = 0.4) %>% 
-  step_impute_knn(all_numeric_predictors(), neighbors = 5) %>% #imputar NAs
+  step_impute_knn(all_numeric_predictors(), neighbors = 5) %>% #impute NAs
   step_zv(all_predictors()) %>%
   step_normalize(all_numeric_predictors())
 
-# Definimos el modelo con tuning
-rf_spec <- rand_forest(trees = 500, mtry = tune() # Dejamos que tidymodels busque el mejor
-  ) %>%
+# Define the model with tuning
+rf_spec <- rand_forest(trees = 500, mtry = tune() ) %>%
   set_engine("ranger", importance = "impurity") %>%
   set_mode("classification")
 
-# Unimos todo en el Workflow
+# Joing everything in the Workflow
 rf_workflow <- workflow() %>%
   add_recipe(rf_recipe) %>%
   add_model(rf_spec)
 
-#mtry <  nº columnas: esto mira la tabla y establece los limites reales que puede tomar el valor 'mtry'
 rf_param <- extract_parameter_set_dials(rf_workflow) %>%  
   finalize(train_data)
-#esto indica que entre los valores que puede tomar 'mtry' (rf_param), que para el grid solo tome 5 y que esten distribuidos uniformemente
-#mtry_grid <- grid_regular(rf_param, levels = 5)
 
+# Defining mtry
 n_cols <- 500
 sqrt_val <- floor(sqrt(n_cols))
 
-# 2. Creamos un vector de mtrys que incluya la raíz cuadrada
-# Por ejemplo: la mitad de la raíz, la raíz, el doble, etc.
 mis_valores_mtry <- c(  floor(sqrt_val / 2), sqrt_val, sqrt_val * 2, 
   floor(n_cols / 3), floor(n_cols / 2))
-
-# Limpiamos duplicados y valores que se pasen del máximo (por si acaso)
 mis_valores_mtry <- unique(pmin(mis_valores_mtry, n_cols))
-
-# 3. Definimos el grid manual
 mtry_grid <- expand.grid(mtry = mis_valores_mtry)
 
-# Ejecutamos el tuning
+# Execute tuning
 rf_results <- tune_grid(
   rf_workflow,
   resamples = cv_folds,
@@ -181,13 +182,10 @@ rf_results <- tune_grid(
 
 autoplot(rf_results)
 
-# 5. EL PASO FINAL: last_fit
-# Elegimos el mejor modelo basado en ROC AUC
+# Last step: last fit
+# Choosing best model based on ROC AUC
 best_params <- select_best(rf_results, metric = "roc_auc")
 final_wf <- finalize_workflow(rf_workflow, best_params)
-
-# Aquí está la fluidez: last_fit entrena en TODO el train y evalúa en el TEST de una vez
-# Pero ojo: como imputamos fuera, le pasamos un split artificial de los datos limpios
 my_metrics <- metric_set(accuracy, roc_auc, yardstick::sensitivity, yardstick::specificity)
 final_split <- make_splits(train_data, test_data) 
 final_res <- last_fit(final_wf, split = final_split,
@@ -195,45 +193,48 @@ final_res <- last_fit(final_wf, split = final_split,
 
 #Metrics Results
 metrics_original <- collect_metrics(final_res)
-metrics_original
+kable(metrics_original, caption ="Metrics Results")
 
-#Confusion Matrix
+
+# Confusion Matrix
 collect_predictions(final_res) %>%
-  conf_mat(truth = diagnosis, estimate = .pred_class) 
+  conf_mat(truth = diagnosis, estimate = .pred_class) %>%
+  pluck("table") %>% # Extraemos solo la matriz numérica
+  kable(caption = "Confusion Matrix")
 
-###### BAJO EL UMBRAL DE 0.5 a 0.45
-# Ver las probabilidades en lugar de solo la clase
+###### Lowering classification threshold from 0.5 to 0.45
 preds <- collect_predictions(final_res)
 
-# 1. Preparar el dataframe con la nueva clase según el umbral 0.45
+# Preparing dataframe with the new class with the 0.45 threshold
 preds_ajustadas <- collect_predictions(final_res) %>%
   mutate(
     .pred_class_045 = if_else(.pred_Severe > 0.45, "Severe", "Non-severe"),
     .pred_class_045 = factor(.pred_class_045, levels = c("Severe", "Non-severe"))
   )
 
-# Comprobar la nueva matriz de confusión
-conf_mat(preds_ajustadas, truth = diagnosis, estimate = .pred_class_045)
+# Confusion matrix
+preds_ajustadas %>% 
+  conf_mat(truth = diagnosis, estimate = .pred_class_045)  %>%
+   pluck("table") %>% 
+   kable(caption = "Final Confusion Matrix")
 
-# 2. Definir el conjunto de métricas (metric_set)
+
+# Metrics Selection
 mis_metricas <- metric_set(accuracy, yardstick::sensitivity, yardstick::specificity)
-
-# 3. Calcular métricas de clase (dependen del umbral 0.45)
 tabla_metricas_clase <- preds_ajustadas %>%
   mis_metricas(truth = diagnosis, estimate = .pred_class_045)
 
-# 4. Calcular métricas probabilísticas (NO dependen del umbral, se usan las probs originales)
-# El roc_auc evalúa la calidad de la predicción numérica
+# 4. Calculate metrics probabilities 
 metricas_prob <- collect_predictions(final_res) %>%
   metric_set(roc_auc)(truth = diagnosis, .pred_Severe)
 
-# 5. Unir todo en un solo resultado limpio
+# Join result
 resultado_final <- bind_rows(tabla_metricas_clase, metricas_prob)
-print(resultado_final)
+kable(resultado_final, caption = "Final Metrics Results")
 
-#ROC Curve
+# ROC Curve
 collect_predictions(final_res) %>%
-  roc_curve(truth = diagnosis, .pred_Severe) %>% # Ajusta 'Severe' a tu clase positiva
+  roc_curve(truth = diagnosis, .pred_Severe) %>% 
   autoplot()
 ```
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
@@ -257,17 +258,17 @@ Compare your selected features to the proteins reported by the authors in Supple
 df_S5 <- read_excel("data/raw_data/Table-S5.Protein-Metabolite-Matrix.xlsx", sheet = 2, skip = 1) |>
   rename("Proteins/Metabolites" = 1, "Gene Symbol" = 2) |>  clean_names() |> filter(gene_symbol != "NA")
 
-# Extraemos el modelo entrenado del objeto final_res
+# Extract trained model from object final_res
 final_fit_model <- final_res %>% 
   extract_fit_parsnip()
 
-# Creamos el gráfico de importancia
+# Importance feature plot
 final_fit_model %>%
   vip(num_features = 25, geom = "point") +
   theme_minimal() +
   labs(title = "Top 25 Proteins")
 
-#Save importat_features results as a data frame
+# Save important_features results as a data frame
 table_importance <- final_fit_model %>%
   vi()
 top25_proteins <- data.frame(proteins_metabolites = table_importance$Variable, importance = table_importance$Importance)
@@ -317,18 +318,16 @@ df_external <- read_excel("data/raw_data/Table-S4.Protein-Metabolite-Matrix-C2.x
   rename("Proteins/Metabolites" = 1, "Gene Symbol" = 2) |>  
   clean_names() |> filter(gene_symbol != "NA")
 
-#Trasposing data (rows: patients / columns: proteins)
+# Preparing data 
 m_t_external <- t(df_external[3:ncol(df_external)]) 
 colnames(m_t_external) <- df_external$proteins_metabolites
-
-#Random Forest needs data in a dataframe (y que los IDs no sean una columna de variables)
 df_t_external <- as.data.frame(m_t_external)
 df_t_external <- data.frame(patient_id_a = str_to_upper(rownames(m_t_external)), df_t_external)
 
-#Adding Level of Severity
+# Adding Level of Severity
 df_2_external <- df_t_external |>
   inner_join(df_metadata |> select(patient_id_a, group), by = "patient_id_a")
-#Removing IDs
+# Removing IDs
 df_2_external <- data.frame(diagnosis = df_2_external$group, df_2_external[3:(ncol(df_2_external)-1)]) |> mutate(diagnosis = as.factor(diagnosis))
 df_2_external$diagnosis <- factor(df_2_external$diagnosis, levels = c("Severe","Non-severe"), ordered = TRUE)
 
@@ -347,57 +346,46 @@ if (length(criticas) < 1) {
 ### RETRAINING THE MODEL ###
 set.seed(123)
 
-#Los dos datasets deben tener las mismas columnas
+# Both datasets have the same columns
 common_cols <- intersect(colnames(df_2_protein), colnames(df_2_external))
 train_data_S4 <- df_2_protein |> select(all_of(common_cols))
 test_data_S4 <- df_2_external |> select(all_of(common_cols))
 
-# 3. EL WORKFLOW 
-# Definimos la receta (solo para normalizar y limpiar varianza cero)
+# WORKFLOW 
+# Define recipe (normalization and  y cleaning variance)
 rf_recipe_S4 <- recipe(diagnosis ~ ., data = train_data_S4) %>%
   step_filter_missing(all_predictors(), threshold = 0.3) %>% 
   step_impute_knn(all_numeric_predictors(), neighbors = 5) %>% #imputar NAs
   step_zv(all_predictors()) %>%
   step_normalize(all_numeric_predictors())
 
-# Definimos el modelo con tuning
+# Define the model with tuning
 rf_spec_S4 <- rand_forest(
     trees = 500,
-    mtry = tune() # Dejamos que tidymodels busque el mejor
+    mtry = tune() 
   ) %>%
   set_engine("ranger", importance = "impurity") %>%
   set_mode("classification")
 
-# Unimos todo en el Workflow
+# Join everything in the Workflow
 rf_workflow_S4 <- workflow() %>%
   add_recipe(rf_recipe_S4) %>%
   add_model(rf_spec_S4)
 
-# 4. VALIDACIÓN CRUZADA Y TUNING (Combinado)
+# Cross-validation and tuning
 cv_folds_S4 <- vfold_cv(train_data_S4, v = 5, strata = diagnosis)
 
-
-#mtry <  nº columnas: esto mira la tabla y establece los limites reales que puede tomar el valor 'mtry'
+# setting mtry
 rf_param <- extract_parameter_set_dials(rf_workflow_S4) %>%  
   finalize(train_data_S4)
-#esto indica que entre los valores que puede tomar 'mtry' (rf_param), que para el grid solo tome 5 y que esten distribuidos uniformemente
-#mtry_grid <- grid_regular(rf_param, levels = 5)
-
 n_cols <- 500
 sqrt_val <- floor(sqrt(n_cols))
-
-# 2. Creamos un vector de mtrys que incluya la raíz cuadrada
-# Por ejemplo: la mitad de la raíz, la raíz, el doble, etc.
 mis_valores_mtry <- c(  floor(sqrt_val / 2), sqrt_val, sqrt_val * 2, 
   floor(n_cols / 3), floor(n_cols / 2))
-
-# Limpiamos duplicados y valores que se pasen del máximo (por si acaso)
 mis_valores_mtry <- unique(pmin(mis_valores_mtry, n_cols))
-
-# 3. Definimos el grid manual
 mtry_grid <- expand.grid(mtry = mis_valores_mtry)
 
-# Ejecutamos el tuning
+# Execute tuning
 rf_results_S4 <- tune_grid(
   rf_workflow_S4,
   resamples = cv_folds_S4,
@@ -407,57 +395,54 @@ rf_results_S4 <- tune_grid(
 
 autoplot(rf_results_S4)
 
-# 5. EL PASO FINAL: last_fit
+# Last Step : Last Fit
 # Elegimos el mejor modelo basado en ROC AUC
 best_params_S4 <- select_best(rf_results_S4, metric = "roc_auc")
 final_wf_S4 <- finalize_workflow(rf_workflow_S4, best_params_S4)
-
-# last_fit entrena en TODO el train y evalúa en el TEST de una vez
-# Pero ojo: como imputamos fuera, le pasamos un split artificial de los datos limpios
 my_metrics_S4 <- metric_set(accuracy, roc_auc, yardstick::sensitivity, yardstick::specificity)
 final_split_S4 <- make_splits(train_data_S4, test_data_S4) 
 final_res_S4 <- last_fit(final_wf_S4, split = final_split_S4,
                       metrics = my_metrics_S4)
 
-
-#Metrics Results
+# Metrics Results
 metrics_original <- collect_metrics(final_res_S4)
-metrics_original
+kable(metrics_original, caption = "Metrics Results")
 
-#Confusion Matrix
+# Confusion Matrix
 collect_predictions(final_res_S4) %>%
-  conf_mat(truth = diagnosis, estimate = .pred_class) 
+  conf_mat(truth = diagnosis, estimate = .pred_class) %>%
+  pluck("table") %>% # Extraemos solo la matriz numérica
+  kable(caption = "Confusion Matriz")
 
+###### Lowering classification threshold from 0.5 to 0.45
 
-###### BAJO EL UMBRAL DE 0.5 a 0.45
-# Ver las probabilidades en lugar de solo la clase
 preds <- collect_predictions(final_res)
 
-# 1. Preparar el dataframe con la nueva clase según el umbral 0.45
+# Prepare dataframe with the new class using threshold 0.45
 preds_ajustadas_S4 <- collect_predictions(final_res_S4) %>%
   mutate(
     .pred_class_045 = if_else(.pred_Severe > 0.45, "Severe", "Non-severe"),
     .pred_class_045 = factor(.pred_class_045, levels = c("Severe", "Non-severe"))
   )
 
-# Comprobar la nueva matriz de confusión
-conf_mat(preds_ajustadas_S4, truth = diagnosis, estimate = .pred_class_045)
+# Confusion Matrix
+preds_ajustadas_S4 %>% 
+  conf_mat(truth = diagnosis, estimate = .pred_class_045)  %>%
+   pluck("table") %>% 
+   kable(caption = "Final Confusion Matrix")
 
-# 2. Definir el conjunto de métricas (metric_set)
+# Define metrics selection 
 mis_metricas <- metric_set(accuracy, yardstick::sensitivity, yardstick::specificity)
 
-# 3. Calcular métricas de clase (dependen del umbral 0.45)
+# Calculate metrics (for threshold 0.45)
 tabla_metricas_clase_S4 <- preds_ajustadas_S4 %>%
   mis_metricas(truth = diagnosis, estimate = .pred_class_045)
-
-# 4. Calcular métricas probabilísticas (NO dependen del umbral, se usan las probs originales)
-# El roc_auc evalúa la calidad de la predicción numérica
 metricas_prob_S4 <- collect_predictions(final_res_S4) %>%
   metric_set(roc_auc)(truth = diagnosis, .pred_Severe)
 
-# 5. Unir todo en un solo resultado limpio
+# Joining the results
 resultado_final_S4 <- bind_rows(tabla_metricas_clase_S4, metricas_prob_S4)
-print(resultado_final_S4)
+kable(resultado_final_S4, caption = "Final Metrics Results")
 
 #ROC Curve
 collect_predictions(final_res_S4) %>%
@@ -470,7 +455,9 @@ For assigning the class labels to patients from the independent cohort (n=10), t
 
 With these results, we can conclude that while the model perfectly identifies Severe patients (zero false negatives), its ability for identifying Non-severe patients is weak, as it only correctly predicts half of them, leading to a high number of false positives (Non-severe patients classified as Severe). For these reasons, the current model could be useful as a high-sensitivity screening tool but it wouldn't be suitable for a definitive clinical diagnosis.
 
-# session info {.unnumbered}
+# Session info {.unnumbered}
+<details>
+<summary><strong>Session Information</strong> (Click to show)</summary>
 
 ```{r, results='asis',  echo=FALSE, message=FALSE }
 sessionInfo()
